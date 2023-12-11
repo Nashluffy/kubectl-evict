@@ -1,30 +1,33 @@
 package cmd
 
 import (
-	"context"
-	"errors"
-	"fmt"
-
-	"github.com/spf13/cobra"
-	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
+    "context"
+    "errors"
+    "fmt"
+    "github.com/spf13/cobra"
+    "io"
+    appsv1 "k8s.io/api/apps/v1"
+    batchv1 "k8s.io/api/batch/v1"
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/fields"
+    "k8s.io/apimachinery/pkg/labels"
+    "k8s.io/apimachinery/pkg/runtime"
+    "k8s.io/cli-runtime/pkg/genericclioptions"
+    "k8s.io/cli-runtime/pkg/resource"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/kubernetes/scheme"
+    corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+    _ "k8s.io/client-go/plugin/pkg/client/auth"
+    "os"
+    "sync"
+    "time"
 )
 
 const (
-	evictUsageStr = "evict (POD | TYPE/NAME)"
+    evictUsageStr = "evict (POD | TYPE/NAME)"
 
-	evictExample = `
+    evictExample = `
 	# Evict a pod nginx
 	kubectl evict nginx
 
@@ -39,226 +42,292 @@ const (
 )
 
 var (
-	evictUsageErrStr = fmt.Sprintf("expected '%s'.\nPOD or TYPE/NAME is a required argument for the evict command", evictUsageStr)
+    evictUsageErrStr = fmt.Sprintf("expected '%s'.\nPOD or TYPE/NAME is a required argument for the evict command", evictUsageStr)
 )
 
 type EvictOptions struct {
-	configFlags *genericclioptions.ConfigFlags
+    configFlags *genericclioptions.ConfigFlags
 
-	GracePeriodSeconds int64
-	DryRun             bool
+    GracePeriodSeconds int64
+    DryRun             bool
 
-	ResourceArg string
-	Selector    string
-	Object      runtime.Object
+    Concurrent  bool
+    ResourceArg string
+    Selector    string
+    Object      runtime.Object
 
-	genericclioptions.IOStreams
+    genericclioptions.IOStreams
 }
 
 func NewEvictOptions(streams genericclioptions.IOStreams) *EvictOptions {
-	configFlags := genericclioptions.NewConfigFlags(true)
+    configFlags := genericclioptions.NewConfigFlags(true)
 
-	return &EvictOptions{
-		configFlags: configFlags,
+    return &EvictOptions{
+        configFlags: configFlags,
 
-		IOStreams: streams,
-	}
+        IOStreams: streams,
+    }
 }
 
 // NewCmdEvict provides a cobra command wrapping EvictOptions
 func NewCmdEvict(streams genericclioptions.IOStreams) *cobra.Command {
-	o := NewEvictOptions(streams)
+    o := NewEvictOptions(streams)
 
-	cmd := &cobra.Command{
-		Use:          evictUsageStr,
-		Short:        "Evict a pod or specified resource from the cluster",
-		Example:      evictExample,
-		SilenceUsage: true,
-		RunE: func(c *cobra.Command, args []string) error {
-			if err := o.Complete(c, args); err != nil {
-				return err
-			}
-			if err := o.RunEvict(c.Context()); err != nil {
-				return err
-			}
+    cmd := &cobra.Command{
+        Use:          evictUsageStr,
+        Short:        "Evict a pod or specified resource from the cluster",
+        Example:      evictExample,
+        SilenceUsage: true,
+        RunE: func(c *cobra.Command, args []string) error {
+            if err := o.Complete(c, args); err != nil {
+                return err
+            }
+            if err := o.RunEvict(c.Context()); err != nil {
+                return err
+            }
 
-			return nil
-		},
-	}
+            return nil
+        },
+    }
 
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on.")
-	cmd.Flags().BoolVar(&o.DryRun, "dry-run", false, "If true, submit server-side request without persisting the resource.")
-	cmd.Flags().Int64Var(&o.GracePeriodSeconds, "grace-period", -1, "Period of time in seconds given to the resource to terminate gracefully. Ignored if negative.")
+    cmd.Flags().BoolVar(&o.Concurrent, "concurrent", false, "Evict pods concurrently. This means that even if one pod fails to evict, others may succeed.")
+    cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on.")
+    cmd.Flags().BoolVar(&o.DryRun, "dry-run", false, "If true, submit server-side request without persisting the resource.")
+    cmd.Flags().Int64Var(&o.GracePeriodSeconds, "grace-period", -1, "Period of time in seconds given to the resource to terminate gracefully. Ignored if negative.")
 
-	o.configFlags.AddFlags(cmd.PersistentFlags())
+    o.configFlags.AddFlags(cmd.PersistentFlags())
 
-	return cmd
+    return cmd
 }
 
 func (o *EvictOptions) Complete(cmd *cobra.Command, args []string) error {
-	switch len(args) {
-	case 0:
-		if len(o.Selector) == 0 {
-			return fmt.Errorf(evictUsageErrStr)
-		}
-	case 1:
-		o.ResourceArg = args[0]
-		if len(o.Selector) != 0 {
-			return fmt.Errorf("only a selector (-l) or a resource name is allowed")
-		}
-	default:
-		return fmt.Errorf(evictUsageErrStr)
-	}
+    switch len(args) {
+    case 0:
+        if len(o.Selector) == 0 {
+            return fmt.Errorf(evictUsageErrStr)
+        }
+    case 1:
+        o.ResourceArg = args[0]
+        if len(o.Selector) != 0 {
+            return fmt.Errorf("only a selector (-l) or a resource name is allowed")
+        }
+    default:
+        return fmt.Errorf(evictUsageErrStr)
+    }
 
-	var err error
-	namespace, namespaceOverwride, err := o.configFlags.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
-		return err
-	}
-	b := resource.NewBuilder(o.configFlags).
-		WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
-		NamespaceParam(namespace).DefaultNamespace().
-		SingleResourceType()
-	if o.ResourceArg != "" {
-		b.ResourceNames("pods", o.ResourceArg)
-	}
-	if o.Selector != "" {
-		b.ResourceTypes("pods").LabelSelectorParam(o.Selector)
-	}
+    var err error
+    namespace, namespaceOverwride, err := o.configFlags.ToRawKubeConfigLoader().Namespace()
+    if err != nil {
+        return err
+    }
+    b := resource.NewBuilder(o.configFlags).
+        WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
+        NamespaceParam(namespace).DefaultNamespace().
+        SingleResourceType()
+    if o.ResourceArg != "" {
+        b.ResourceNames("pods", o.ResourceArg)
+    }
+    if o.Selector != "" {
+        b.ResourceTypes("pods").LabelSelectorParam(o.Selector)
+    }
 
-	infos, err := b.Do().Infos()
-	if err != nil {
-		return err
-	}
-	if o.Selector == "" && len(infos) != 1 {
-		return errors.New("expected a resource")
-	}
-	o.Object = infos[0].Object
-	if o.Selector != "" && len(o.Object.(*corev1.PodList).Items) == 0 {
-		return fmt.Errorf("no resources found in %s namespace", namespace)
-	}
-	if _, ok := o.Object.(*corev1.Node); namespaceOverwride && ok {
-		return errors.New("--namespace should not be specified with node target")
-	}
+    infos, err := b.Do().Infos()
+    if err != nil {
+        return err
+    }
+    if o.Selector == "" && len(infos) != 1 {
+        return errors.New("expected a resource")
+    }
+    o.Object = infos[0].Object
+    if o.Selector != "" && len(o.Object.(*corev1.PodList).Items) == 0 {
+        return fmt.Errorf("no resources found in %s namespace", namespace)
+    }
+    if _, ok := o.Object.(*corev1.Node); namespaceOverwride && ok {
+        return errors.New("--namespace should not be specified with node target")
+    }
 
-	return nil
+    return nil
 }
 
 // Run evicts a pod or pods on the resources
 func (o *EvictOptions) RunEvict(ctx context.Context) error {
-	clientConfig, err := o.configFlags.ToRESTConfig()
-	if err != nil {
-		return err
-	}
-	api, err := kubernetes.NewForConfig(clientConfig)
-	if err != nil {
-		return err
-	}
-	pods, err := podsForObject(ctx, api.CoreV1(), o.Object)
-	if err != nil {
-		return err
-	}
+    clientConfig, err := o.configFlags.ToRESTConfig()
+    if err != nil {
+        return err
+    }
+    api, err := kubernetes.NewForConfig(clientConfig)
+    if err != nil {
+        return err
+    }
+    pods, err := podsForObject(ctx, api.CoreV1(), o.Object)
+    if err != nil {
+        return err
+    }
 
-	opts := new(metav1.DeleteOptions)
-	if o.GracePeriodSeconds >= 0 {
-		opts.GracePeriodSeconds = &o.GracePeriodSeconds
-	}
-	if o.DryRun {
-		opts.DryRun = []string{metav1.DryRunAll}
-	}
+    opts := new(metav1.DeleteOptions)
+    if o.GracePeriodSeconds >= 0 {
+        opts.GracePeriodSeconds = &o.GracePeriodSeconds
+    }
+    if o.DryRun {
+        opts.DryRun = []string{metav1.DryRunAll}
+    }
 
-	verb := "evicted"
-	if o.DryRun {
-		verb = "evicted (dry-run)"
-	}
+    verb := "evicted"
+    if o.DryRun {
+        verb = "evicted (dry-run)"
+    }
 
-	eviction := NewEvictClient(api)
-	for _, pod := range pods {
-		err := eviction.EvictPod(ctx, pod, opts)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(o.Out, "pod %s/%s %s\n", pod.Namespace, pod.Name, verb)
-	}
-	return nil
+    eviction := NewEvictClient(api)
+    if o.Concurrent {
+        output := make(chan *EvictionOutput, len(pods))
+        wg := sync.WaitGroup{}
+
+        go printFromEvictionOutputChannel(output, os.Stdout, os.Stderr, &wg)
+        evictPodsConcurrently(ctx, eviction, pods, opts, verb, output)
+
+        wg.Wait()
+        return nil
+    }
+    return evictPods(ctx, eviction, pods, opts, verb)
+}
+
+type EvictionOutput struct {
+    Pod    string
+    Output string
+    Error  error
+}
+
+func printFromEvictionOutputChannel(output chan *EvictionOutput, stdout io.Writer, stderr io.Writer, wg *sync.WaitGroup) {
+    wg.Add(1)
+    for evictionOutput := range output {
+        if evictionOutput.Error != nil {
+            log := fmt.Sprintf("failed to evict %s: %s\n", evictionOutput.Pod, evictionOutput.Error.Error())
+            fmt.Fprint(stderr, addTimestampToString(log))
+        } else {
+            fmt.Fprint(stdout, addTimestampToString(evictionOutput.Output))
+        }
+    }
+    wg.Done()
+}
+
+func addTimestampToString(s string) string {
+    return fmt.Sprintf("[%s] %s", time.Now().UTC().Format(time.RFC1123), s)
+}
+
+func evictPods(ctx context.Context, eviction Client, pods []corev1.Pod, opts *metav1.DeleteOptions, verb string) error {
+    for _, pod := range pods {
+        err := eviction.EvictPod(ctx, pod, opts)
+        if err != nil {
+            return err
+        }
+        fmt.Printf("pod %s/%s %s\n", pod.Namespace, pod.Name, verb)
+    }
+    return nil
+}
+
+func evictPodsConcurrently(ctx context.Context, eviction Client, pods []corev1.Pod, opts *metav1.DeleteOptions, verb string, output chan *EvictionOutput) {
+    var wg sync.WaitGroup
+    for _, pod := range pods {
+        wg.Add(1)
+        go func(pod corev1.Pod) {
+            defer wg.Done()
+            backoff := 5
+            err := eviction.EvictPod(ctx, pod, opts)
+            for err != nil {
+                output <- &EvictionOutput{
+                    Pod:   pod.Name,
+                    Error: fmt.Errorf("%s (retrying in %d seconds)", err.Error(), backoff),
+                }
+                time.Sleep(time.Duration(backoff) * time.Second)
+                backoff += 5
+                err = eviction.EvictPod(ctx, pod, opts)
+            }
+            output <- &EvictionOutput{
+                Output: fmt.Sprintf("pod %s/%s %s\n", pod.Namespace, pod.Name, verb),
+                Pod:    pod.Name,
+            }
+        }(pod)
+    }
+    wg.Wait()
+    close(output)
 }
 
 func podsForObject(ctx context.Context, api corev1client.CoreV1Interface, object runtime.Object) ([]corev1.Pod, error) {
-	switch t := object.(type) {
-	case *corev1.PodList:
-		return t.Items, nil
+    switch t := object.(type) {
+    case *corev1.PodList:
+        return t.Items, nil
 
-	case *corev1.Pod:
-		return []corev1.Pod{*t}, nil
-	}
+    case *corev1.Pod:
+        return []corev1.Pod{*t}, nil
+    }
 
-	namespace, labelsel, fieldsel, err := selectorsForObject(object)
-	if err != nil {
-		return nil, fmt.Errorf("cannot get the logs from %T: %v", object, err)
-	}
+    namespace, labelsel, fieldsel, err := selectorsForObject(object)
+    if err != nil {
+        return nil, fmt.Errorf("cannot get the logs from %T: %v", object, err)
+    }
 
-	opt := metav1.ListOptions{}
-	if labelsel != nil {
-		opt.LabelSelector = labelsel.String()
-	}
-	if fieldsel != nil {
-		opt.FieldSelector = fieldsel.String()
-	}
+    opt := metav1.ListOptions{}
+    if labelsel != nil {
+        opt.LabelSelector = labelsel.String()
+    }
+    if fieldsel != nil {
+        opt.FieldSelector = fieldsel.String()
+    }
 
-	info, err := api.Pods(namespace).List(ctx, opt)
-	if err != nil {
-		return nil, err
-	}
-	return info.Items, nil
+    info, err := api.Pods(namespace).List(ctx, opt)
+    if err != nil {
+        return nil, err
+    }
+    return info.Items, nil
 }
 
 func selectorsForObject(object runtime.Object) (namespace string, labelsel labels.Selector, fieldsel fields.Selector, err error) {
-	switch t := object.(type) {
-	case *appsv1.ReplicaSet:
-		namespace = t.Namespace
-		labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
-		}
-	case *corev1.ReplicationController:
-		namespace = t.Namespace
-		labelsel = labels.SelectorFromSet(t.Spec.Selector)
-	case *appsv1.StatefulSet:
-		namespace = t.Namespace
-		labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
-		}
-	case *appsv1.DaemonSet:
-		namespace = t.Namespace
-		labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
-		}
+    switch t := object.(type) {
+    case *appsv1.ReplicaSet:
+        namespace = t.Namespace
+        labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
+        if err != nil {
+            return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
+        }
+    case *corev1.ReplicationController:
+        namespace = t.Namespace
+        labelsel = labels.SelectorFromSet(t.Spec.Selector)
+    case *appsv1.StatefulSet:
+        namespace = t.Namespace
+        labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
+        if err != nil {
+            return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
+        }
+    case *appsv1.DaemonSet:
+        namespace = t.Namespace
+        labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
+        if err != nil {
+            return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
+        }
 
-	case *appsv1.Deployment:
-		namespace = t.Namespace
-		labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
-		}
-	case *batchv1.Job:
-		namespace = t.Namespace
-		labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
-		}
-	case *corev1.Service:
-		namespace = t.Namespace
-		if t.Spec.Selector == nil || len(t.Spec.Selector) == 0 {
-			return "", nil, nil, fmt.Errorf("invalid service '%s': Service is defined without a selector", t.Name)
-		}
-		labelsel = labels.SelectorFromSet(t.Spec.Selector)
-	case *corev1.Node:
-		namespace = metav1.NamespaceAll
-		fieldsel = fields.SelectorFromSet(fields.Set{"spec.nodeName": t.Name})
-	default:
-		return "", nil, nil, fmt.Errorf("selector for %T not implemented", object)
-	}
-	return namespace, labelsel, fieldsel, nil
+    case *appsv1.Deployment:
+        namespace = t.Namespace
+        labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
+        if err != nil {
+            return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
+        }
+    case *batchv1.Job:
+        namespace = t.Namespace
+        labelsel, err = metav1.LabelSelectorAsSelector(t.Spec.Selector)
+        if err != nil {
+            return "", nil, nil, fmt.Errorf("invalid label selector: %v", err)
+        }
+    case *corev1.Service:
+        namespace = t.Namespace
+        if t.Spec.Selector == nil || len(t.Spec.Selector) == 0 {
+            return "", nil, nil, fmt.Errorf("invalid service '%s': Service is defined without a selector", t.Name)
+        }
+        labelsel = labels.SelectorFromSet(t.Spec.Selector)
+    case *corev1.Node:
+        namespace = metav1.NamespaceAll
+        fieldsel = fields.SelectorFromSet(fields.Set{"spec.nodeName": t.Name})
+    default:
+        return "", nil, nil, fmt.Errorf("selector for %T not implemented", object)
+    }
+    return namespace, labelsel, fieldsel, nil
 }
